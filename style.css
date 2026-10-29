@@ -65,6 +65,7 @@ h1{margin:0;font:500 28px 'Cormorant Garamond',serif;letter-spacing:.2px;white-s
 #gl{position:absolute;inset:0;width:100%;height:100%;display:block;cursor:grab}
 #gl:active{cursor:grabbing}
 .viewer-msg{position:absolute;inset:0;display:grid;place-items:center;text-align:center;padding:30px;color:var(--muted);font:italic 500 18px 'Cormorant Garamond',serif}
+.viewer-msg[hidden]{display:none}
 .title-block{position:absolute;left:20px;top:14px;pointer-events:none}
 .title-block h2{margin:0;font:500 38px/1.05 'Cormorant Garamond',serif}
 .title-block p{margin:2px 0 10px;font:italic 500 19px 'Cormorant Garamond',serif;color:var(--muted)}

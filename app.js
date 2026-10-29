@@ -56,7 +56,73 @@ function tubeGeo(points, radius, segs, closed) {
   return new T.TubeGeometry(new T.CatmullRomCurve3(points, closed), segs || points.length * 4, radius, 8, !!closed);
 }
 
-const EXTERNAL = new Set(['axon', 'myelin', 'dendrites', 'terminals', 'flagellum', 'pili', 'microvilli', 'junctions', 'plate']);
+/* sphere deformed by fn(unitDir) -> unit-space point, then scaled by dims; keeps the unit dirs for region lookups */
+function radialGeo(seg, fn, dims) {
+  const g = new T.SphereGeometry(1, seg, Math.round(seg / 2)), pos = g.attributes.position, v = new T.Vector3(), dirs = new Float32Array(pos.count * 3);
+  for (let i = 0; i < pos.count; i++) {
+    v.fromBufferAttribute(pos, i).normalize(); dirs[i * 3] = v.x; dirs[i * 3 + 1] = v.y; dirs[i * 3 + 2] = v.z;
+    const q = fn(v.clone());
+    pos.setXYZ(i, q.x * dims[0], q.y * dims[1], q.z * dims[2]);
+  }
+  g.userData.dirs = dirs; g.computeVertexNormals();
+  return g;
+}
+const smooth = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+
+/* organ body shapes (body.shape). Upright frame: +y up, +z front (anterior), +x the organ's own left. */
+const SHAPES = {
+  heart: {
+    geo(dims, b, seed, seg) {
+      return radialGeo(seg, v => {
+        const t = (v.y + 1) / 2, lat = .22 + .78 * Math.pow(t, .5);
+        let x = v.x * lat, y = v.y, z = v.z * lat * (v.z < 0 ? .86 : 1);
+        if (y > .55) y = .55 + (y - .55) * .55;                                   // flatter base where the vessels leave
+        const groove = Math.exp(-Math.pow((v.x + .08 + .12 * v.y) / .09, 2)) * smooth(0, .4, v.z) * (1 - smooth(.3, .6, v.y));
+        const atria = .07 * Math.exp(-(Math.pow(v.x + .55, 2) + Math.pow(v.y - .55, 2)) / .08) + .05 * Math.exp(-(Math.pow(v.x - .45, 2) + Math.pow(v.y - .5, 2) + Math.pow(v.z + .3, 2)) / .1);
+        const k = (1 - .045 * groove + atria) * (1 + (b.noise || 0) * Math.sin(v.x * 4 + seed) * Math.sin(v.y * 3 + seed * 1.3));
+        return new T.Vector3(x * k, y * k, z * k);
+      }, dims);
+    }
+  },
+  brain: {
+    geo(dims, b, seed, seg) {
+      return radialGeo(seg, v => {
+        let x = v.x * (1 - .1 * Math.max(0, v.z)), y = v.y < 0 ? v.y * .74 : v.y, z = v.z;
+        // temporal lobes hang lower at the sides; the frontal base is flatter
+        y -= .16 * smooth(.45, .85, Math.abs(v.x)) * smooth(-.6, -.2, v.z) * (1 - smooth(.55, .9, v.z)) * smooth(.3, -.2, v.y);
+        if (v.z > .4 && v.y < 0) y *= 1 - .25 * smooth(.4, .9, v.z);
+        const fissure = Math.exp(-Math.pow(v.x / .055, 2)) * smooth(-.3, .15, v.y);
+        const syl = Math.exp(-Math.pow((v.y - (.04 - .34 * v.z)) / .05, 2)) * smooth(.35, .6, Math.abs(v.x)) * smooth(-.45, -.1, v.z);
+        const n = Math.sin(v.x * 7.5 + 2 * Math.sin(v.z * 5 + seed)) + Math.sin(v.y * 8 + 2 * Math.sin(v.x * 5.5)) + Math.sin(v.z * 8.5 + 2 * Math.sin(v.y * 6 + seed));
+        const sulci = Math.exp(-Math.pow(n / .3, 2));
+        const k = 1 - .2 * fissure - .08 * syl - .06 * sulci;
+        return new T.Vector3(x * k, y * k, z * k);
+      }, dims);
+    },
+    region(x, y, z) {
+      if (Math.abs(x) > .3 && z > -.6 && y < .02 - .34 * z) return 'temporal';
+      if (z < -.62 + .12 * y) return 'occipital';
+      if (z > .12 - .22 * y) return 'frontal';
+      return 'parietal';
+    }
+  }
+};
+function shellGeo(dims, b, seed, seg) {
+  return b.shape && SHAPES[b.shape] ? SHAPES[b.shape].geo(dims, b, seed, b.seg || seg) : superGeo(dims, b.p, b.noise, seed, seg);
+}
+/* generic lump for organ structures: taper (narrower at -y) and ridges (folds around the x axis) */
+function blobGeo(o) {
+  return radialGeo(o.seg || 40, v => {
+    const lat = o.taper ? 1 - o.taper * (1 - (v.y + 1) / 2) : 1;
+    let k = 1;
+    if (o.ridges) k *= 1 + .045 * Math.sin(Math.atan2(v.y, v.z) * o.ridges) - .12 * Math.exp(-Math.pow(v.x / .1, 2)) * smooth(0, .4, -v.z);
+    if (o.noise) k *= 1 + o.noise * Math.sin(v.x * 5 + 1) * Math.sin(v.y * 4 + 2) * Math.sin(v.z * 3 + 3);
+    return new T.Vector3(v.x * lat * k, v.y * k, v.z * lat * k);
+  }, o.dims || [.3, .3, .3]);
+}
+
+// kinds drawn whole even in cross-section (not clipped); a part can override with `clip`
+const EXTERNAL = new Set(['axon', 'myelin', 'dendrites', 'terminals', 'flagellum', 'pili', 'microvilli', 'junctions', 'plate', 'blob', 'tube', 'valve', 'node', 'stalk']);
 
 function buildCell(cell) {
   const rng = mulberry32(cell.seed || 1), b = cell.body, dims = b.dims, p = b.p;
@@ -74,7 +140,7 @@ function buildCell(cell) {
       clearcoat: o.clear != null ? o.clear : .55, clearcoatRoughness: .3, side: o.side || T.DoubleSide,
       transparent: (o.op || 1) < 1, opacity: o.op || 1
     });
-    mats.push({ m, op: o.op || 1, role: o.role || 'org', part: o.part, clip: !EXTERNAL.has(o.kind) });
+    mats.push({ m, op: o.op || 1, role: o.role || 'org', part: o.part, clip: o.clip != null ? o.clip : !EXTERNAL.has(o.kind) });
     return m;
   }
   function sample(k) {
@@ -264,39 +330,99 @@ function buildCell(cell) {
         const bulb = new T.Mesh(new T.SphereGeometry(.075, 12, 10), m); bulb.position.copy(end); g.add(bulb);
       }
     },
+    /* --- organ kinds: positions are absolute (`at`), `mirror` repeats a part on the other side (x -> -x) --- */
+    blob(o, g) {
+      sides(o).forEach(s => {
+        const m = new T.Mesh(blobGeo(o), pm(o, null, { op: o.op }));
+        m.position.set(o.at[0] * s, o.at[1], o.at[2]); if (o.rot) m.rotation.set(o.rot[0], o.rot[1] * s, o.rot[2] * s); g.add(m);
+      });
+    },
+    tube(o, g) {
+      const m = pm(o);
+      const one = (path, r, s) => {
+        let pts = path.map(p => new T.Vector3(p[0] * s, p[1], p[2]));
+        if (o.surface) pts = new T.CatmullRomCurve3(pts).getPoints(pts.length * 8).map(onShell);
+        const t = new T.Mesh(tubeGeo(pts, r, pts.length * 6), m); if (o.flat) t.scale.x = o.flat; g.add(t);
+        if (!o.open) [pts[0], pts[pts.length - 1]].forEach(p => { const c = new T.Mesh(new T.SphereGeometry(r, 12, 10), m); c.position.copy(p); if (o.flat) { c.position.x *= o.flat; c.scale.x = o.flat; } g.add(c); });
+      };
+      sides(o).forEach(s => { one(o.path, o.r || .1, s); (o.branches || []).forEach(br => one(br, (o.r || .1) * .62, s)); });
+    },
+    valve(o, g) {
+      const r = o.r || .2, n = o.cusps || 3, c = new T.Group();
+      const ring = new T.Mesh(new T.TorusGeometry(r, r * .13, 8, 32), pm(o)); ring.rotation.x = Math.PI / 2; c.add(ring);
+      const leaf = pm(o, new T.Color(o.color).offsetHSL(0, 0, .1).getStyle());
+      for (let i = 0; i < n; i++) {
+        const cusp = new T.Mesh(new T.SphereGeometry(r * .96, 12, 6, i * 6.283 / n + .04, 6.283 / n - .08, Math.PI / 2, Math.PI / 2.1), leaf);
+        cusp.scale.y = .55; c.add(cusp);
+      }
+      c.position.set(...o.at); if (o.rot) c.rotation.set(...o.rot); g.add(c);
+    },
+    node(o, g) {
+      const core = new T.Mesh(new T.SphereGeometry(o.r || .06, 16, 12), pm(o)); core.position.set(...o.at); g.add(core);
+      const halo = new T.Mesh(new T.SphereGeometry((o.r || .06) * 2, 16, 12), pm(o, null, { op: .3 })); halo.position.set(...o.at); g.add(halo);
+    },
+    stalk(o, g) {
+      const prof = o.profile, L = o.len || 1, pts = prof.map((r, i) => new T.Vector2(Math.max(r, .0001), -L * i / (prof.length - 1)));
+      const m = new T.Mesh(new T.LatheGeometry(new T.SplineCurve(pts).getPoints(prof.length * 6), 24), pm(o));
+      m.position.set(...o.at); if (o.rot) m.rotation.set(...o.rot); g.add(m);
+    },
+    lobe(o, g) {
+      // re-uses the body shell's vertices; keeps only the triangles whose direction falls in this region
+      const src = shellMesh.geometry, d = src.userData.dirs, idx = src.index.array, keep = [], region = SHAPES[b.shape].region;
+      for (let i = 0; i < idx.length; i += 3) {
+        let x = 0, y = 0, z = 0; for (let k = 0; k < 3; k++) { const j = idx[i + k] * 3; x += d[j]; y += d[j + 1]; z += d[j + 2]; }
+        if (region(x / 3, y / 3, z / 3) === o.region) keep.push(idx[i], idx[i + 1], idx[i + 2]);
+      }
+      const geo = new T.BufferGeometry(); geo.setAttribute('position', src.attributes.position); geo.setAttribute('normal', src.attributes.normal); geo.setIndex(keep);
+      const m = new T.Mesh(geo, pm(o, null, { role: 'shell', side: T.FrontSide, rough: .55 })); m.scale.setScalar(1.004); g.add(m);
+    },
     body() { /* handled separately */ }
   };
+  function pm(o, color, x) { return mat(color || o.color, Object.assign({ part: o.id, kind: o.kind, clip: o.clip }, x)); }
+  function sides(o) { return o.mirror ? [1, -1] : [1]; }
+  // projects a point onto the body surface along its direction from the centre (for vessels lying on an organ)
+  const ray = new T.Raycaster();
+  function onShell(p) {
+    const dir = p.clone().normalize(); ray.set(dir.clone().multiplyScalar(8), dir.clone().negate());
+    const h = ray.intersectObject(shellMesh, false)[0];
+    return h ? h.point.add(h.face.normal.multiplyScalar(.035)) : p;
+  }
   group.userData.kinds = KINDS;
 
   /* --- body shell(s) --- */
   const bodyDef = cell.organelles.find(o => o.kind === 'body') || { id: '__body', color: b.layers[0].color };
   const bodyGroup = new T.Group(); bodyGroup.userData.oid = bodyDef.id; parts[bodyDef.id] = bodyGroup;
+  let shellMesh = null;
   b.layers.forEach((l, i) => {
     const m = mat(l.color, { op: l.opacity, role: 'shell', part: bodyDef.id, side: T.FrontSide, rough: .5 });
-    const mesh = new T.Mesh(superGeo([dims[0] * l.s, dims[1] * l.s, dims[2] * l.s], p, b.noise, cell.seed, 72), m);
+    const mesh = new T.Mesh(shellGeo([dims[0] * l.s, dims[1] * l.s, dims[2] * l.s], b, cell.seed, 72), m);
     if (l.opacity < 1) mesh.renderOrder = 2;
-    bodyGroup.add(mesh);
+    bodyGroup.add(mesh); if (!i) shellMesh = mesh;
   });
-  cyto = new T.Mesh(superGeo(dims.map(d => d * .975), p, b.noise, cell.seed, 56), mat(b.cyto, { role: 'cyto', side: T.BackSide, rough: .8, clear: 0, part: '__cyto' }));
+  cyto = new T.Mesh(shellGeo(dims.map(d => d * .975), b, cell.seed, 56), mat(b.cyto, { role: 'cyto', side: T.BackSide, rough: .8, clear: 0, part: '__cyto' }));
   group.add(cyto); group.add(bodyGroup);
 
   /* --- organelles --- */
+  const partOf = {};          // sub-part id -> parent part id (selecting the parent highlights its sub-parts)
   cell.organelles.forEach(o => {
+    if (o.of) partOf[o.id] = o.of;
     if (o.kind === 'body') return;
     const g = new T.Group(); g.userData.oid = o.id; parts[o.id] = g;
     (KINDS[o.kind] || (() => {}))(o, g); group.add(g);
   });
 
+  if (cell.tilt) { group.rotation.set(...cell.tilt); group.updateMatrixWorld(true); }
   const box = new T.Box3().setFromObject(bodyGroup), planeC = .12 * Math.max(...dims);
-  return { group, mats, parts, cyto, cell, box, planeC, sc };
+  return { group, mats, parts, partOf, cyto, cell, box, planeC, sc };
 }
 
 /* applies mode / focus / selection to a built cell */
 function applyState(C, mode, focus, sel, plane) {
+  const hit = id => !!sel && (id === sel || C.partOf[id] === sel);
   C.mats.forEach(e => {
     let op = e.op;
     if (e.role === 'shell' && mode === 'xray') op = Math.min(op, .2);
-    const dim = focus === 'isolate' && sel && e.part !== sel && e.role !== 'cyto';
+    const dim = focus === 'isolate' && sel && !hit(e.part) && e.role !== 'cyto';
     if (dim) op *= .12;
     const m = e.m;
     m.opacity = op; m.transparent = op < .999; m.depthWrite = op > .55;
@@ -304,10 +430,9 @@ function applyState(C, mode, focus, sel, plane) {
     const want = clip ? [plane] : null;
     if ((m.clippingPlanes ? 1 : 0) !== (want ? 1 : 0)) m.needsUpdate = true;
     m.clippingPlanes = want;
-    const isSel = sel && e.part === sel;
-    m.emissive.copy(m.color); m.emissiveIntensity = isSel ? .45 : (e.role === 'cyto' ? .22 : .1);
+    m.emissive.copy(m.color); m.emissiveIntensity = hit(e.part) ? .45 : (e.role === 'cyto' ? .22 : .1);
   });
-  Object.keys(C.parts).forEach(id => { C.parts[id].visible = !(focus === 'hide' && sel && id !== sel); });
+  Object.keys(C.parts).forEach(id => { C.parts[id].visible = !(focus === 'hide' && sel && !hit(id)); });
   C.cyto.visible = mode !== 'xray' && !focus;
 }
 
@@ -355,7 +480,8 @@ function loadCell(cell) {
   orbit.home = JSON.parse(JSON.stringify({ az: orbit.g.az, el: orbit.g.el, dist: orbit.g.dist, t: orbit.g.target.toArray() }));
   if (!orbit.cur) orbit.cur = { az: orbit.g.az, el: orbit.g.el, dist: orbit.g.dist, target: orbit.g.target.clone() };
   shadowMesh.visible = cell.id !== 'neuron';
-  shadowMesh.scale.set(ext * 1.5, ext * 1.5, 1); shadowMesh.position.y = d.min.y - (cell.id === 'epithelial' ? .3 : .06);
+  const low = cell.category === 'Cell' ? d.min.y : new T.Box3().setFromObject(current.group).min.y;   // organs have parts below the body
+  shadowMesh.scale.set(ext * 1.5, ext * 1.5, 1); shadowMesh.position.y = low - (cell.id === 'epithelial' ? .3 : .06);
   refreshState();
 }
 function refreshState() { if (current) applyState(current, S.mode, S.focus, S.sel, clipPlane); }
@@ -385,7 +511,7 @@ function pick(e) {
   for (const h of hits) {
     if (h.object === current.cyto) continue;
     // respect the clipping plane
-    if (S.mode === 'section' && clipPlane.distanceToPoint(h.point) < 0) continue;
+    if (S.mode === 'section' && h.object.material.clippingPlanes && clipPlane.distanceToPoint(h.point) < 0) continue;
     let o = h.object; while (o && !(o.userData && o.userData.oid)) o = o.parent;
     if (o) { selectOrg(o.userData.oid); return; }
   }
@@ -493,12 +619,13 @@ function renderOrganelleList() {
   const c = cur();
   $('#organelle-list').innerHTML = shown(c).map(o => `<li data-oid="${o.id}" class="${o.id === S.sel ? 'active' : ''}"><span class="dot" style="background:${o.color || c.body.layers[0].color}"></span>${o.name}</li>`).join('');
 }
+const partWord = c => c.category === 'Cell' ? 'Organelle' : 'Part';
 function orgColor(o) { return o.color || cur().body.layers[0].color; }
 function renderDetail() {
   const c = cur(), o = shown(c).find(x => x.id === S.sel) || shown(c)[0], fav = !!S.favOrg[c.id + ':' + o.id], col = orgColor(o);
-  $('#detail-panel').innerHTML = `<h2 class="sec">ORGANELLE DETAILS <button class="heart ${fav ? 'on' : ''}" id="heart" title="Save">${fav ? '♥' : '♡'}</button></h2>
+  $('#detail-panel').innerHTML = `<h2 class="sec">${partWord(c).toUpperCase()} DETAILS <button class="heart ${fav ? 'on' : ''}" id="heart" title="Save">${fav ? '♥' : '♡'}</button></h2>
     <div class="org-head"><div class="org-ico" style="background:radial-gradient(circle at 35% 30%,#fff9,${col} 55%,${col})"></div><div><b>${o.name}</b><small>${o.tag || ''}</small></div></div>
-    <dl class="kv"><dt>Size</dt><dd>${o.size || '—'}</dd><dt>Location</dt><dd>${o.location || '—'}</dd><dt>Visible in LM</dt><dd>${o.lm || '—'}</dd>
+    <dl class="kv"><dt>Size</dt><dd>${o.size || '—'}</dd><dt>Location</dt><dd>${o.location || '—'}</dd>${o.fn ? `<dt>Function</dt><dd>${o.fn}</dd>` : `<dt>Visible in LM</dt><dd>${o.lm || '—'}</dd>`}
     <dt>Label</dt><dd class="sw"><input type="checkbox" class="switch" id="sw-label" ${S.labels ? 'checked' : ''}><span class="dot" style="background:${col}"></span></dd></dl>`;
   $('#org-label').textContent = o.name; $('#org-label').style.setProperty('--lc', col);
 }
@@ -530,8 +657,10 @@ function applyAccent() { document.documentElement.style.setProperty('--accent', 
 /* modal */
 function openModal(html) { $('#modal-body').innerHTML = html; $('#modal').hidden = false; }
 function closeModal() { $('#modal').hidden = true; }
-const kindLabel = { nucleus: 'Nucleus', nucleolus: 'Nucleolus', mito: 'Mitochondria', chloroplast: 'Chloroplasts', golgi: 'Golgi apparatus', er: 'Endoplasmic reticulum', vacuole: 'Large vacuole', dots: 'Ribosomes / vesicles', microvilli: 'Microvilli', junctions: 'Cell junctions', plate: 'Basement membrane', nucleoid: 'Nucleoid (free DNA)', flagellum: 'Flagellum', pili: 'Pili', myofibril: 'Myofibrils', axon: 'Axon', myelin: 'Myelin', dendrites: 'Dendrites', terminals: 'Axon terminals', body: 'Outer wall / membrane' };
-const kindInfo = { nucleus: 'Holds the genome and directs cell activity.', mito: 'Makes ATP — the cell’s energy currency.', chloroplast: 'Converts light into chemical energy.', golgi: 'Modifies, sorts and ships proteins.', er: 'Folds proteins (rough) or makes lipids (smooth).', vacuole: 'Stores water and nutrients; keeps the cell firm.', dots: 'Small structures that build or carry cargo.', microvilli: 'Finger-like folds that increase absorptive surface.', nucleoid: 'Region where a prokaryote’s DNA is held.', flagellum: 'Whip-like motor for swimming.', pili: 'Hair-like surface fibres for attachment.', myofibril: 'Contractile bundles that shorten to produce force.', axon: 'Carries electrical signals away from the cell body.', dendrites: 'Branches that receive incoming signals.' };
+const kindLabel = { nucleus: 'Nucleus', nucleolus: 'Nucleolus', mito: 'Mitochondria', chloroplast: 'Chloroplasts', golgi: 'Golgi apparatus', er: 'Endoplasmic reticulum', vacuole: 'Large vacuole', dots: 'Ribosomes / vesicles', microvilli: 'Microvilli', junctions: 'Cell junctions', plate: 'Basement membrane', nucleoid: 'Nucleoid (free DNA)', flagellum: 'Flagellum', pili: 'Pili', myofibril: 'Myofibrils', axon: 'Axon', myelin: 'Myelin', dendrites: 'Dendrites', terminals: 'Axon terminals', body: 'Outer wall / membrane',
+  blob: 'Organ structures', tube: 'Vessels & tracts', valve: 'Heart valves', node: 'Pacemaker nodes', stalk: 'Brainstem', lobe: 'Cerebral lobes' };
+const kindInfo = { nucleus: 'Holds the genome and directs cell activity.', mito: 'Makes ATP — the cell’s energy currency.', chloroplast: 'Converts light into chemical energy.', golgi: 'Modifies, sorts and ships proteins.', er: 'Folds proteins (rough) or makes lipids (smooth).', vacuole: 'Stores water and nutrients; keeps the cell firm.', dots: 'Small structures that build or carry cargo.', microvilli: 'Finger-like folds that increase absorptive surface.', nucleoid: 'Region where a prokaryote’s DNA is held.', flagellum: 'Whip-like motor for swimming.', pili: 'Hair-like surface fibres for attachment.', myofibril: 'Contractile bundles that shorten to produce force.', axon: 'Carries electrical signals away from the cell body.', dendrites: 'Branches that receive incoming signals.',
+  valve: 'One-way flaps that keep blood flowing forward.', node: 'Clusters of cells that set and relay the heartbeat.', lobe: 'Regions of the cerebral cortex with different jobs.' };
 
 function openGallery() {
   openModal(`<h3>Gallery</h3><div class="grid-cards">${CELLS.map(c => `<div class="gcard" data-pick="${c.id}">${thumbs[c.id] ? `<img src="${thumbs[c.id]}" alt="">` : '<div class="ph"></div>'}<b>${c.name}</b><small>${c.type}</small></div>`).join('')}</div>`);
@@ -560,7 +689,7 @@ function openCompare() {
   const has = (c, k) => c.organelles.some(o => o.kind === k);
   const head = c => `<div class="cmp-head">${thumbs[c.id] ? `<img src="${thumbs[c.id]}" alt="">` : ''}<b>${c.name}</b><small>${c.type}</small></div>`;
   openModal(`<h3>Compare cells</h3><table class="cmp-table"><tr><th></th><th>${head(a)}</th><th>${head(b)}</th></tr>
-    <tr><td>Organelle count</td><td>${shown(a).length - 1}</td><td>${shown(b).length - 1}</td></tr>
+    <tr><td>Parts listed</td><td>${shown(a).length - 1}</td><td>${shown(b).length - 1}</td></tr>
     ${kinds.map(k => `<tr><td>${kindLabel[k] || k}</td><td class="${has(a, k) ? 'yes' : 'no'}">${has(a, k) ? '✓' : '—'}</td><td class="${has(b, k) ? 'yes' : 'no'}">${has(b, k) ? '✓' : '—'}</td></tr>`).join('')}
     <tr><td>Notes</td><td>${a.notes}</td><td>${b.notes}</td></tr></table>`);
 }
@@ -572,6 +701,7 @@ function openComparePicker() {
 function selectCell(id) {
   S.cellId = id; store.set('cell', id); S.sel = null; S.focus = null; S.cat = cellById(id).category;
   const c = cur(); S.sel = c.organelles[0].id;
+  $('#parts-title').textContent = '✦ ' + partWord(c).toUpperCase() + 'S';
   $('#cell-title').textContent = c.name; $('#cell-sub').textContent = c.type;
   applyAccent(); renderCellList(); renderOrganelleList(); renderDetail(); renderNotes(); renderWhere(); renderMicro(); S.compareId = null; renderCompare();
   syncToolbar(); loadCell(c); refreshState();
